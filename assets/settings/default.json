@@ -1719,6 +1719,14 @@
     "enable_status": true,
     // Whether to enable git diff display.
     "enable_diff": true,
+    // Whether the Git panel automatically fetches from all remotes.
+    //
+    // Default: true
+    "auto_fetch": true,
+    // How often the Git panel automatically fetches, in seconds.
+    //
+    // Default: 60
+    "auto_fetch_interval_seconds": 60,
     // Control whether the git gutter is shown. May take 2 values:
     // 1. Show the gutter
     //      "git_gutter": "tracked_files"

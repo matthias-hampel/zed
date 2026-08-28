@@ -3422,7 +3422,7 @@ impl GitStore {
 
         let remote_output = repository_handle
             .update(&mut cx, |repository_handle, cx| {
-                repository_handle.fetch(fetch_options, askpass, cx)
+                repository_handle.fetch(fetch_options, askpass, true, cx)
             })
             .await??;
 
@@ -8553,7 +8553,7 @@ impl Repository {
         askpass: AskPassDelegate,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
-        let receiver = self.fetch(FetchOptions::Unshallow, askpass, cx);
+        let receiver = self.fetch(FetchOptions::Unshallow, askpass, true, cx);
         self.unshallow_state = UnshallowState::InProgress;
         cx.notify();
         let (tx, rx) = oneshot::channel();
@@ -8581,6 +8581,7 @@ impl Repository {
         &mut self,
         fetch_options: FetchOptions,
         askpass: AskPassDelegate,
+        show_status: bool,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
         let askpass_delegates = self.askpass_delegates.clone();
@@ -8599,7 +8600,7 @@ impl Repository {
         let this = cx.weak_entity();
         self.send_job(
             "fetch",
-            Some("git fetch".into()),
+            show_status.then(|| "git fetch".into()),
             move |git_repo, mut cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
@@ -11311,6 +11312,61 @@ mod tests {
             },
         );
         (delegate, prompt_receiver)
+    }
+
+    #[gpui::test]
+    async fn fetch_can_run_without_publishing_status(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            state.fetch_delay = Some(Duration::from_secs(1));
+        })
+        .expect("fake repository should exist");
+
+        let (askpass, _prompts) = test_askpass_delegate(cx);
+        let fetch = repository.update(cx, |repository, cx| {
+            repository.fetch(FetchOptions::All, askpass, false, cx)
+        });
+        cx.run_until_parked();
+        repository.read_with(cx, |repository, _| {
+            assert!(repository.current_job().is_none());
+        });
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert!(matches!(fetch.await, Ok(Ok(_))));
+
+        let (askpass, _prompts) = test_askpass_delegate(cx);
+        let fetch = repository.update(cx, |repository, cx| {
+            repository.fetch(FetchOptions::All, askpass, true, cx)
+        });
+        cx.run_until_parked();
+        repository.read_with(cx, |repository, _| {
+            assert_eq!(
+                repository.current_job().map(|job| job.message),
+                Some("git fetch".into())
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert!(matches!(fetch.await, Ok(Ok(_))));
     }
 
     #[gpui::test]

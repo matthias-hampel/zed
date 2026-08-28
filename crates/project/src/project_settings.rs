@@ -26,7 +26,10 @@ use settings::{
     LocalSettingsPath, RegisterSetting, SemanticTokenRules, Settings, SettingsLocation,
     SettingsStore, parse_json_with_comments, watch_config_file,
 };
-use std::{cell::OnceCell, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::OnceCell, collections::BTreeMap, num::NonZeroU32, path::PathBuf, sync::Arc,
+    time::Duration,
+};
 use task::{DebugTaskFile, TaskTemplates, VsCodeDebugTaskFile, VsCodeTaskFile};
 use util::{ResultExt, rel_path::RelPath, serde::default_true};
 use worktree::{PathChange, UpdatedEntriesSet, Worktree, WorktreeId};
@@ -461,6 +464,14 @@ pub struct GitSettings {
     ///
     /// Default: true
     pub enabled: GitEnabledSettings,
+    /// Whether the Git panel automatically fetches from all remotes.
+    ///
+    /// Default: true
+    pub auto_fetch: bool,
+    /// How often the Git panel automatically fetches, in seconds.
+    ///
+    /// Default: 60
+    pub auto_fetch_interval_seconds: NonZeroU32,
     /// Whether or not to show the git gutter.
     ///
     /// Default: tracked_files
@@ -686,6 +697,8 @@ impl Settings for ProjectSettings {
         };
         let git_settings = GitSettings {
             enabled: git_enabled,
+            auto_fetch: git.auto_fetch.unwrap(),
+            auto_fetch_interval_seconds: git.auto_fetch_interval_seconds.unwrap(),
             git_gutter: git.git_gutter.unwrap(),
             gutter_debounce: git.gutter_debounce.unwrap_or_default(),
             inline_blame: {

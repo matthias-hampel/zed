@@ -4,6 +4,7 @@ use settings::{
     AudioInputDeviceName, AudioOutputDeviceName, EditPredictionDataCollectionChoice,
     LanguageSettingsContent, SemanticTokens, SettingsContent,
 };
+use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 use strum::{EnumMessage, IntoDiscriminant as _, VariantArray};
 use theme::SystemAppearance;
@@ -7787,6 +7788,45 @@ fn version_control_page() -> SettingsPage {
                                         .enabled
                                         .get_or_insert_default()
                                         .enable_diff = value;
+                                },
+                            }),
+                            metadata: None,
+                        },
+                        SettingItem {
+                            files: USER,
+                            title: "Git Auto-Fetch",
+                            description: "Automatically fetch from all Git remotes.",
+                            field: Box::new(SettingField::<bool> {
+                                organization_override: None,
+                                json_path: Some("git.auto_fetch"),
+                                pick: |settings_content| {
+                                    settings_content.git.as_ref()?.auto_fetch.as_ref()
+                                },
+                                write: |settings_content, value, _| {
+                                    settings_content.git.get_or_insert_default().auto_fetch = value;
+                                },
+                            }),
+                            metadata: None,
+                        },
+                        SettingItem {
+                            files: USER,
+                            title: "Git Auto-Fetch Interval",
+                            description: "How often to automatically fetch, in seconds.",
+                            field: Box::new(SettingField::<NonZeroU32> {
+                                organization_override: None,
+                                json_path: Some("git.auto_fetch_interval_seconds"),
+                                pick: |settings_content| {
+                                    settings_content
+                                        .git
+                                        .as_ref()?
+                                        .auto_fetch_interval_seconds
+                                        .as_ref()
+                                },
+                                write: |settings_content, value, _| {
+                                    settings_content
+                                        .git
+                                        .get_or_insert_default()
+                                        .auto_fetch_interval_seconds = value;
                                 },
                             }),
                             metadata: None,

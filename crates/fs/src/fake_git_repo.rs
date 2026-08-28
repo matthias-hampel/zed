@@ -14,8 +14,8 @@ use git::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
         GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-        commit_hash_search_query,
+        PushOptions, RefEdit, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -27,7 +27,12 @@ use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use ignore::gitignore::GitignoreBuilder;
 use parking_lot::Mutex;
 use rope::Rope;
-use std::{path::PathBuf, sync::Arc, sync::atomic::AtomicBool, time::SystemTime};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    sync::atomic::AtomicBool,
+    time::{Duration, SystemTime},
+};
 use text::LineEnding;
 use util::{paths::PathStyle, rel_path::RelPath};
 
@@ -81,6 +86,8 @@ pub struct FakeGitRepositoryState {
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
+    pub fetch_count: usize,
+    pub fetch_delay: Option<Duration>,
 }
 
 impl FakeGitRepositoryState {
@@ -108,6 +115,8 @@ impl FakeGitRepositoryState {
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            fetch_count: 0,
+            fetch_delay: None,
         }
     }
 }
@@ -1179,7 +1188,21 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        let fetch = self.with_state_async(false, |state| {
+            state.fetch_count += 1;
+            Ok(state.fetch_delay)
+        });
+        let executor = self.executor.clone();
+        async move {
+            if let Some(fetch_delay) = fetch.await? {
+                executor.timer(fetch_delay).await;
+            }
+            Ok(RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        .boxed()
     }
 
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {

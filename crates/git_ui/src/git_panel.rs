@@ -1066,6 +1066,7 @@ pub struct GitPanel {
     new_staged_count: usize,
     pending_commit: Option<Task<()>>,
     pending_remote_operation: Option<RemoteOperationKind>,
+    pending_remote_operation_is_visible: bool,
     amend_pending: bool,
     original_commit_message: Option<String>,
     pending_commit_message_restores: BTreeMap<String, SerializedCommitMessage>,
@@ -1081,6 +1082,7 @@ pub struct GitPanel {
     tracked_staged_count: usize,
     update_visible_entries_task: Task<()>,
     reopen_commit_buffer_task: Task<()>,
+    _automatic_fetch_task: Task<()>,
     pub(crate) workspace: WeakEntity<Workspace>,
     context_menu: Option<GitPanelContextMenu>,
     modal_open: bool,
@@ -1230,6 +1232,10 @@ impl GitPanel {
             let mut was_file_icons = GitPanelSettings::get_global(cx).file_icons;
             let mut was_folder_indicator = GitPanelSettings::get_global(cx).folder_indicator;
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
+            let mut was_auto_fetch = ProjectSettings::get_global(cx).git.auto_fetch;
+            let mut was_auto_fetch_interval_seconds = ProjectSettings::get_global(cx)
+                .git
+                .auto_fetch_interval_seconds;
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
                 let sort_by = settings.sort_by;
@@ -1238,6 +1244,9 @@ impl GitPanel {
                 let file_icons = settings.file_icons;
                 let folder_indicator = settings.folder_indicator;
                 let diff_stats = settings.diff_stats;
+                let git_settings = &ProjectSettings::get_global(cx).git;
+                let auto_fetch = git_settings.auto_fetch;
+                let auto_fetch_interval_seconds = git_settings.auto_fetch_interval_seconds;
                 if tree_view != was_tree_view {
                     match (&mut this.view_mode, tree_view) {
                         (GitPanelViewMode::Tree(state), false) => {
@@ -1266,12 +1275,19 @@ impl GitPanel {
                 if file_icons != was_file_icons || folder_indicator != was_folder_indicator {
                     cx.notify();
                 }
+                if auto_fetch != was_auto_fetch
+                    || auto_fetch_interval_seconds != was_auto_fetch_interval_seconds
+                {
+                    this.restart_automatic_fetch_task(window, cx);
+                }
                 was_sort_by = sort_by;
                 was_group_by = group_by;
                 was_tree_view = tree_view;
                 was_file_icons = file_icons;
                 was_folder_indicator = folder_indicator;
                 was_diff_stats = diff_stats;
+                was_auto_fetch = auto_fetch;
+                was_auto_fetch_interval_seconds = auto_fetch_interval_seconds;
             })
             .detach();
 
@@ -1298,6 +1314,8 @@ impl GitPanel {
                 }
             });
 
+            let automatic_fetch_task = Self::automatic_fetch_task(window, cx);
+
             let registry = LanguageModelRegistry::global(cx);
             cx.subscribe(&registry, |_, _, event, cx| match event {
                 LanguageModelEvent::CommitMessageModelChanged
@@ -1322,9 +1340,12 @@ impl GitPanel {
                         true,
                     )
                     | GitStoreEvent::RepositoryAdded
-                    | GitStoreEvent::RepositoryRemoved(_)
-                    | GitStoreEvent::ActiveRepositoryChanged(_) => {
+                    | GitStoreEvent::RepositoryRemoved(_) => {
                         this.schedule_update(window, cx);
+                    }
+                    GitStoreEvent::ActiveRepositoryChanged(_) => {
+                        this.schedule_update(window, cx);
+                        this.fetch_automatically(window, cx);
                     }
                     GitStoreEvent::GlobalConfigurationUpdated => {
                         this.git_access = None;
@@ -1366,6 +1387,7 @@ impl GitPanel {
                 diff_stat_total: DiffStat::default(),
                 pending_commit: None,
                 pending_remote_operation: None,
+                pending_remote_operation_is_visible: false,
                 amend_pending,
                 original_commit_message,
                 pending_commit_message_restores,
@@ -1383,6 +1405,7 @@ impl GitPanel {
                 tracked_staged_count: 0,
                 update_visible_entries_task: Task::ready(()),
                 reopen_commit_buffer_task: Task::ready(()),
+                _automatic_fetch_task: automatic_fetch_task,
                 show_placeholders: false,
                 local_committer: None,
                 local_committer_task: None,
@@ -1410,6 +1433,32 @@ impl GitPanel {
             this.schedule_update(window, cx);
             this
         })
+    }
+
+    fn automatic_fetch_task(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let git_settings = &ProjectSettings::get_global(cx).git;
+        if !git_settings.auto_fetch {
+            return Task::ready(());
+        }
+
+        let interval = Duration::from_secs(git_settings.auto_fetch_interval_seconds.get().into());
+        cx.spawn_in(window, async move |git_panel, cx| {
+            loop {
+                if git_panel
+                    .update_in(cx, |git_panel, window, cx| {
+                        git_panel.fetch_automatically(window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(interval).await;
+            }
+        })
+    }
+
+    fn restart_automatic_fetch_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._automatic_fetch_task = Self::automatic_fetch_task(window, cx);
     }
 
     pub fn entry_by_path(&self, path: &RepoPath) -> Option<usize> {
@@ -3884,6 +3933,23 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.fetch_with_feedback(is_fetch_all, true, window, cx);
+    }
+
+    fn fetch_automatically(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !ProjectSettings::get_global(cx).git.auto_fetch {
+            return;
+        }
+        self.fetch_with_feedback(true, false, window, cx);
+    }
+
+    fn fetch_with_feedback(
+        &mut self,
+        is_fetch_all: bool,
+        show_feedback: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_push_and_pull(cx) {
             return;
         }
@@ -3891,11 +3957,13 @@ impl GitPanel {
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
-        if !self.start_remote_operation(RemoteOperationKind::Fetch, cx) {
+        if !self.start_remote_operation(RemoteOperationKind::Fetch, show_feedback, cx) {
             return;
         }
 
-        telemetry::event!("Git Fetched");
+        if show_feedback {
+            telemetry::event!("Git Fetched");
+        }
         let askpass = self.askpass_delegate("git fetch", window, cx);
         let this = cx.weak_entity();
 
@@ -3915,7 +3983,7 @@ impl GitPanel {
                     return Ok(());
                 };
                 let fetch = repo.update(cx, |repo, cx| {
-                    repo.fetch(fetch_options.clone(), askpass, cx)
+                    repo.fetch(fetch_options.clone(), askpass, show_feedback, cx)
                 });
 
                 let remote_message = fetch.await?;
@@ -3925,10 +3993,16 @@ impl GitPanel {
                         FetchOptions::Remote(remote) => RemoteAction::Fetch(Some(remote)),
                     };
                     match remote_message {
-                        Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
-                        Err(e) => {
-                            log::error!("Error while fetching {:?}", e);
-                            this.show_error_toast(action.name(), e, cx)
+                        Ok(remote_message) => {
+                            if show_feedback {
+                                this.show_remote_output(action, remote_message, cx);
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Error while fetching {:?}", error);
+                            if show_feedback {
+                                this.show_error_toast(action.name(), error, cx);
+                            }
                         }
                     }
 
@@ -4044,7 +4118,7 @@ impl GitPanel {
         let Some(branch) = repo.read(cx).branch.clone() else {
             return;
         };
-        if !self.start_remote_operation(RemoteOperationKind::Pull, cx) {
+        if !self.start_remote_operation(RemoteOperationKind::Pull, true, cx) {
             return;
         }
 
@@ -4114,7 +4188,7 @@ impl GitPanel {
         let Some(branch) = repo.read(cx).branch.clone() else {
             return;
         };
-        if !self.start_remote_operation(RemoteOperationKind::Push, cx) {
+        if !self.start_remote_operation(RemoteOperationKind::Push, true, cx) {
             return;
         }
 
@@ -4328,6 +4402,7 @@ impl GitPanel {
     fn start_remote_operation(
         &mut self,
         kind: RemoteOperationKind,
+        show_status: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.pending_remote_operation.is_some() {
@@ -4335,13 +4410,25 @@ impl GitPanel {
         }
 
         self.pending_remote_operation = Some(kind);
-        cx.notify();
+        self.pending_remote_operation_is_visible = show_status;
+        if show_status {
+            cx.notify();
+        }
         true
     }
 
     fn clear_remote_operation(&mut self, cx: &mut Context<Self>) {
+        let was_visible = self.pending_remote_operation_is_visible;
         self.pending_remote_operation.take();
-        cx.notify();
+        self.pending_remote_operation_is_visible = false;
+        if was_visible {
+            cx.notify();
+        }
+    }
+
+    fn visible_pending_remote_operation(&self) -> Option<RemoteOperationKind> {
+        self.pending_remote_operation
+            .filter(|_| self.pending_remote_operation_is_visible)
     }
 
     fn get_remote(
@@ -6081,7 +6168,7 @@ impl GitPanel {
                         &branch,
                         focus_handle,
                         true,
-                        self.pending_remote_operation,
+                        self.visible_pending_remote_operation(),
                         self.remote_action_menu_handle.clone(),
                     ))
                 })
@@ -12021,23 +12108,219 @@ mod tests {
         let panel = workspace.update_in(cx, GitPanel::new);
 
         panel.update(cx, |panel, cx| {
-            // The first remote operation starts and records its kind, which the
-            // button uses to render an "in progress" tooltip.
-            assert!(panel.start_remote_operation(RemoteOperationKind::Fetch, cx));
+            assert!(panel.start_remote_operation(RemoteOperationKind::Fetch, false, cx));
             assert!(matches!(
                 panel.pending_remote_operation,
                 Some(RemoteOperationKind::Fetch)
             ));
+            assert!(panel.visible_pending_remote_operation().is_none());
 
             // A second remote operation is refused while one is pending, even a
             // different kind: we serialize all remote ops.
-            assert!(!panel.start_remote_operation(RemoteOperationKind::Push, cx));
+            assert!(!panel.start_remote_operation(RemoteOperationKind::Push, true, cx));
 
             // Clearing the pending operation re-opens the gate.
             panel.clear_remote_operation(cx);
             assert!(panel.pending_remote_operation.is_none());
-            assert!(panel.start_remote_operation(RemoteOperationKind::Pull, cx));
+            assert!(panel.start_remote_operation(RemoteOperationKind::Pull, true, cx));
+            assert!(matches!(
+                panel.visible_pending_remote_operation(),
+                Some(RemoteOperationKind::Pull)
+            ));
         });
+    }
+
+    #[gpui::test]
+    async fn test_automatically_fetches_at_configured_interval(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+            }),
+        )
+        .await;
+        fs.set_remote_for_repo(
+            Path::new(path!("/project/.git")),
+            "origin",
+            "https://example.com/project.git",
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .auto_fetch_interval_seconds = Some(std::num::NonZeroU32::MIN);
+                })
+            });
+        });
+        let _panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            1
+        );
+
+        cx.executor()
+            .advance_clock(Duration::from_secs(1) - Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            1
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            2
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            3
+        );
+    }
+
+    #[gpui::test]
+    async fn test_automatic_fetch_can_be_toggled(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+            }),
+        )
+        .await;
+        fs.set_remote_for_repo(
+            Path::new(path!("/project/.git")),
+            "origin",
+            "https://example.com/project.git",
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().auto_fetch = Some(false);
+                })
+            });
+        });
+        let _panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.executor().advance_clock(Duration::from_secs(120));
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            0
+        );
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().auto_fetch = Some(true);
+                })
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            1
+        );
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().auto_fetch = Some(false);
+                })
+            });
+        });
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fetches_when_repository_is_discovered(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "file.txt": "",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let _panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        fs.create_dir(Path::new(path!("/project/.git")))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs.with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.fetch_count
+            })
+            .unwrap(),
+            1
+        );
     }
 
     #[gpui::test]

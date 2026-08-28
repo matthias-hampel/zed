@@ -434,6 +434,7 @@ async fn fetch_remote_for_worktree_base(
                             name: remote_name.clone().into(),
                         }),
                         askpass,
+                        true,
                         cx,
                     )
                 })

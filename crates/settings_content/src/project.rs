@@ -554,6 +554,14 @@ pub struct GitSettings {
     /// Default: true
     #[serde(flatten)]
     pub enabled: Option<GitEnabledSettings>,
+    /// Whether the Git panel automatically fetches from all remotes.
+    ///
+    /// Default: true
+    pub auto_fetch: Option<bool>,
+    /// How often the Git panel automatically fetches, in seconds.
+    ///
+    /// Default: 60
+    pub auto_fetch_interval_seconds: Option<std::num::NonZeroU32>,
     /// Whether or not to show the git gutter.
     ///
     /// Default: tracked_files
